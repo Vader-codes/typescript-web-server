@@ -50,7 +50,7 @@ function newConn(socket) {
         console.error("Client sent:", data.toString());
         // Echo the same bytes back to the client.
         socket.write(data);
-        // If the data includes 'q', close the connection
+        // If the data includes 'q', close the connection/
         if (data.includes("q")) {
             console.log("closing connection.....");
             socket.end();
