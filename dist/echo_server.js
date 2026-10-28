@@ -33,39 +33,110 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-// Import Node's built-in networking module.
 const net = __importStar(require("net"));
-// This is the callback.
-// The runtime will call it when a client connects.
-function newConn(socket) {
-    // // Print the client's IP address and port.
-    console.log("New connection:", socket.remoteAddress, socket.remotePort);
-    // Handle connection errors so the server dosen't crash
-    socket.on("error", (err) => {
-        console.log("Socket error :", err.message);
-    });
-    // Runs every time the client sends bytes.
+// we are creating a new state whenever a client joins our server
+function soInit(socket) {
+    const conn = {
+        socket: socket,
+        err: null,
+        ended: false,
+        reader: null,
+    };
+    // Data arrived. Pause the stream so we don't lose bytes
+    // before the next soRead() call.
     socket.on("data", (data) => {
-        // Print what we received.
-        console.error("Client sent:", data.toString());
-        // Echo the same bytes back to the client.
-        socket.write(data);
-        // If the data includes 'q', close the connection/
-        if (data.includes("q")) {
-            console.log("closing connection.....");
-            socket.end();
+        socket.pause();
+        // If someone is waiting for data, hand it over.
+        if (conn.reader) {
+            conn.reader.resolve(data);
+            conn.reader = null;
         }
     });
+    // Client hung up.
+    socket.on("end", () => {
+        conn.ended = true;
+        // Wake up any pending read with an empty buffer (EOF).
+        if (conn.reader) {
+            conn.reader.resolve(Buffer.from(""));
+            conn.reader = null;
+        }
+    });
+    // Network error or broken pipe.
+    socket.on("error", (err) => {
+        conn.err = err;
+        // If a read is blocked, fail it immediately.
+        if (conn.reader) {
+            conn.reader.reject(err);
+            conn.reader = null;
+        }
+    });
+    return conn;
 }
-// 1. Create the Listening Socket.
-let server = net.createServer();
-// Handle the server error also
-server.on("error", (err) => {
-    console.error("server error", err.message);
-});
-// 2. Register the callback for the 'connection' event.
-// This gives the function to the Event Loop.
+// The custom promise-based read function we're building.
+function soRead(conn) {
+    return new Promise((resolve, reject) => {
+        // Fail fast if the connection is already broken.
+        if (conn.err) {
+            reject(conn.err);
+            return;
+        }
+        // Fail fast with EOF if the client already left.
+        if (conn.ended) {
+            resolve(Buffer.from(""));
+            return;
+        }
+        // Save the callbacks so the 'data' event can trigger them.
+        conn.reader = { resolve: resolve, reject: reject };
+        // Start the stream flowing again.
+        conn.socket.resume();
+    });
+}
+// Promise wrapper for socket.write.
+function soWrite(conn, data) {
+    return new Promise((resolve, reject) => {
+        if (conn.err) {
+            reject(conn.err);
+            return;
+        }
+        // Node's write takes a callback when the OS accepts the bytes.
+        conn.socket.write(data, (err) => {
+            if (err) {
+                reject(err);
+            }
+            else {
+                resolve();
+            }
+        });
+    });
+}
+// The main loop for a single client.
+async function serveClient(socket) {
+    const conn = soInit(socket); // sets some client's state value
+    // Looks synchronous, but yields to the event loop on every await.
+    while (true) {
+        const data = await soRead(conn);
+        // Empty buffer means EOF.
+        if (data.length === 0) {
+            console.log("Client disconnected (EOF)");
+            break;
+        }
+        console.log("Client sent:", data.toString());
+        await soWrite(conn, data);
+    }
+    socket.destroy();
+}
+function newConn(socket) {
+    console.log("New connection:", socket.remoteAddress, socket.remotePort);
+    // Don't await this! If we did, the server would block and only
+    // handle one client at a time.
+    serveClient(socket).catch((err) => {
+        console.error("Client error:", err.message);
+        socket.destroy();
+    });
+}
+// pauseOnConnect is critical. It stops the OS from firing 'data'
+// before we're actually ready to read.
+let server = net.createServer({ pauseOnConnect: true });
 server.on("connection", newConn);
-// 3. Bind and Listen on port 1234.
 server.listen({ host: "127.0.0.1", port: 1234 });
 console.log("Server listening on 127.0.0.1:1234...");
