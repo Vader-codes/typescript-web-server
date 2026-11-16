@@ -8,6 +8,7 @@ import {
   readerFromMemory,
   readerFromReq,
 } from "./http_io";
+import { readerFromFile } from "./static_file";
 import { BufferGenerator } from "./http_types";
 
 // The main loop for a single client.
@@ -57,6 +58,27 @@ async function* countSheep(): BufferGenerator {
 async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
   // Check the URI (convert bytes to string for easy comparison).
   const uri = req.uri.toString("latin1");
+
+  // Serve files from the current directory.
+  if (uri.startsWith("/files/")) {
+    // Extract the filename from the URI.
+    const filePath = uri.slice("/files/".length);
+    try {
+      const body = await readerFromFile(filePath);
+      return {
+        code: 200,
+        headers: [Buffer.from("Content-Type: application/octet-stream")],
+        body: body,
+      };
+    } catch (err) {
+      // File not found or not readable.
+      return {
+        code: 404,
+        headers: [Buffer.from("Content-Type: text/plain")],
+        body: readerFromMemory(Buffer.from("Not Found\n")),
+      };
+    }
+  }
 
   if (uri == "/sheep") {
     return {
@@ -114,31 +136,36 @@ async function writeHTTPResp(conn: TCPConn, res: HTTPRes): Promise<void> {
   //  Send the header bytes.
   await soWrite(conn, Buffer.from(headerText));
 
-  //  Send the body bytes.
-  while (true) {
-    const data = await res.body.read();
+  //  Send the body bytes.and alsways close it when we're done.
+  try {
+    while (true) {
+      const data = await res.body.read();
 
-    if (data.length === 0) {
-      // EOF. If we were chucking , send the terminator
-      if (res.body.length < 0) {
-        await soWrite(conn, Buffer.from("0\r\n\r\n"));
+      if (data.length === 0) {
+        // EOF. If we were chucking , send the terminator
+        if (res.body.length < 0) {
+          await soWrite(conn, Buffer.from("0\r\n\r\n"));
+        }
+        break;
       }
-      break;
-    }
 
-    if (res.body.length < 0) {
-      // chunked code : format  is [hex size]\r\n[data]\r\n
-      const hexsize = data.length.toString(16);
-      const chunk = Buffer.concat([
-        Buffer.from(hexsize + "\r\n"),
-        data,
-        Buffer.from("\r\n"),
-      ]);
-      await soWrite(conn, chunk);
-    } else {
-      // normal mode : just send the raw data
-      await soWrite(conn, data);
+      if (res.body.length < 0) {
+        // chunked code : format  is [hex size]\r\n[data]\r\n
+        const hexsize = data.length.toString(16);
+        const chunk = Buffer.concat([
+          Buffer.from(hexsize + "\r\n"),
+          data,
+          Buffer.from("\r\n"),
+        ]);
+        await soWrite(conn, chunk);
+      } else {
+        // normal mode : just send the raw data
+        await soWrite(conn, data);
+      }
     }
+  } finally {
+    // always close the body
+    await res.body.close?.();
   }
 }
 

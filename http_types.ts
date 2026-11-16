@@ -23,6 +23,8 @@ export type BodyReader = {
   // Read the next chunk of data.
   // Returns an empty buffer when the body is completely read.
   read: () => Promise<Buffer>;
+  // optional cleanup function, called when we're done with the body
+  close?: () => Promise<void>;
 };
 
 // A generator that produces buffer asynchrously.
