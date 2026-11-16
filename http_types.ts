@@ -24,3 +24,6 @@ export type BodyReader = {
   // Returns an empty buffer when the body is completely read.
   read: () => Promise<Buffer>;
 };
+
+// A generator that produces buffer asynchrously.
+export type BufferGenerator = AsyncGenerator<Buffer, void, void>;

@@ -3,7 +3,12 @@ import { TCPConn, soInit, soRead, soWrite } from "./net_io";
 import { DynBuf, bufPush } from "./dynbuf";
 import { cutMessage, HTTPError } from "./http_parser";
 import { HTTPReq, HTTPRes, BodyReader } from "./http_types";
-import { readerFromMemory } from "./http_io";
+import {
+  readerFromGenerator,
+  readerFromMemory,
+  readerFromReq,
+} from "./http_io";
+import { BufferGenerator } from "./http_types";
 
 // The main loop for a single client.
 async function serveClient(socket: net.Socket): Promise<void> {
@@ -40,16 +45,26 @@ async function serveClient(socket: net.Socket): Promise<void> {
   }
 }
 
-// We will implement these in the next steps of the book.
-
-function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
-  return { length: 0, read: async () => Buffer.from("") };
+// A generator that yields a string every second.
+async function* countSheep(): BufferGenerator {
+  for (let i = 0; i < 10; i++) {
+    // Wait 1 second before yielding the next value
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    yield Buffer.from(`Sheep ${i}\n`);
+  }
 }
 
 async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
   // Check the URI (convert bytes to string for easy comparison).
   const uri = req.uri.toString("latin1");
 
+  if (uri == "/sheep") {
+    return {
+      code: 200,
+      headers: [Buffer.from("content-type : text/plain")],
+      body: readerFromGenerator(countSheep()),
+    };
+  }
   if (uri === "/echo") {
     // Echo the request body back.
     let bodyData = Buffer.from("");
@@ -80,25 +95,50 @@ async function writeHTTPResp(conn: TCPConn, res: HTTPRes): Promise<void> {
   const status = res.code === 200 ? "OK" : "Not Found";
   let headerText = `HTTP/1.1 ${res.code} ${status}\r\n`;
 
-  // 2. Add Content-Length (from the BodyReader).
-  headerText += `Content-Length: ${res.body.length}\r\n`;
+  // If the length is -1, we do not know the size, so use chunked encoding.
+  if (res.body.length < 0) {
+    headerText += `Transfer-Encoding : chunked\r\n`;
+  } else {
+    //  Add Content-Length (from the BodyReader).
+    headerText += `Content-Length: ${res.body.length}\r\n`;
+  }
 
-  // 3. Add the custom headers.
+  //  Add the custom headers.
   for (const h of res.headers) {
     headerText += `${h.toString("latin1")}\r\n`;
   }
 
-  // 4. Add the empty line to end the header.
+  //  Add the empty line to end the header.
   headerText += "\r\n";
 
-  // 5. Send the header bytes.
+  //  Send the header bytes.
   await soWrite(conn, Buffer.from(headerText));
 
-  // 6. Send the body bytes.
+  //  Send the body bytes.
   while (true) {
     const data = await res.body.read();
-    if (data.length === 0) break;
-    await soWrite(conn, data);
+
+    if (data.length === 0) {
+      // EOF. If we were chucking , send the terminator
+      if (res.body.length < 0) {
+        await soWrite(conn, Buffer.from("0\r\n\r\n"));
+      }
+      break;
+    }
+
+    if (res.body.length < 0) {
+      // chunked code : format  is [hex size]\r\n[data]\r\n
+      const hexsize = data.length.toString(16);
+      const chunk = Buffer.concat([
+        Buffer.from(hexsize + "\r\n"),
+        data,
+        Buffer.from("\r\n"),
+      ]);
+      await soWrite(conn, chunk);
+    } else {
+      // normal mode : just send the raw data
+      await soWrite(conn, data);
+    }
   }
 }
 
@@ -109,6 +149,7 @@ function newConn(socket: net.Socket): void {
     socket.destroy();
   });
 }
+
 // pauseOnConnect is critical. It stops the OS from firing 'data'
 // before we're actually ready to read.
 let server = net.createServer({ pauseOnConnect: true });
