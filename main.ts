@@ -1,4 +1,5 @@
 import * as net from "net";
+import * as fs from "fs/promises";
 import { TCPConn, soInit, soRead, soWrite } from "./net_io";
 import { DynBuf, bufPush } from "./dynbuf";
 import { cutMessage, HTTPError } from "./http_parser";
@@ -7,8 +8,10 @@ import {
   readerFromGenerator,
   readerFromMemory,
   readerFromReq,
+  fieldGet,
 } from "./http_io";
 import { readerFromFile } from "./static_file";
+import { parseRangeHeader } from "./range";
 import { BufferGenerator } from "./http_types";
 
 // The main loop for a single client.
@@ -35,7 +38,7 @@ async function serveClient(socket: net.Socket): Promise<void> {
     // (These functions don't exist yet, we will build them next)
     const reqBody: BodyReader = readerFromReq(conn, buf, msg);
     const res: HTTPRes = await handleReq(msg, reqBody);
-    await writeHTTPResp(conn, res);
+    await writeHTTPResp(conn, res, msg.method === "HEAD");
 
     // Ensure the request body is completely read.
     // If the handler ignored it, we must drain it here.
@@ -59,19 +62,58 @@ async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
   // Check the URI (convert bytes to string for easy comparison).
   const uri = req.uri.toString("latin1");
 
-  // Serve files from the current directory.
+  // Inside handleReq, replace the existing /files/ block with this:
+
   if (uri.startsWith("/files/")) {
-    // Extract the filename from the URI.
     const filePath = uri.slice("/files/".length);
     try {
-      const body = await readerFromFile(filePath);
-      return {
-        code: 200,
-        headers: [Buffer.from("Content-Type: application/octet-stream")],
-        body: body,
-      };
+      // 1. Get the file size first (we need it for range calculations).
+      const stat = await fs.stat(filePath);
+      const size = stat.size;
+
+      // 2. Check for the Range header.
+      const rangeHeader = fieldGet(req.headers, "Range");
+      let start = 0;
+      let end = size - 1; // Inclusive end.
+      let isPartial = false;
+
+      if (rangeHeader) {
+        const parsed = parseRangeHeader(rangeHeader.toString("latin1"));
+        if (parsed) {
+          start = parsed[0];
+          end = parsed[1] !== null ? parsed[1] : size - 1;
+          // Clamp to file size.
+          if (start >= size) {
+            // Start is beyond the file. Return 416.
+            return {
+              code: 416,
+              headers: [Buffer.from(`Content-Range: bytes */${size}`)],
+              body: readerFromMemory(Buffer.from("")),
+            };
+          }
+          end = Math.min(end, size - 1);
+          isPartial = true;
+        }
+      }
+
+      // 3. Create the BodyReader for the slice.
+      const body = await readerFromFile(filePath, start, end + 1);
+
+      // 4. Build the headers.
+      const headers: Buffer[] = [
+        Buffer.from("Content-Type: application/octet-stream"),
+        Buffer.from("Accept-Ranges: bytes"),
+      ];
+
+      if (isPartial) {
+        headers.push(
+          Buffer.from(`Content-Range: bytes ${start}-${end}/${size}`),
+        );
+        return { code: 206, headers, body };
+      } else {
+        return { code: 200, headers, body };
+      }
     } catch (err) {
-      // File not found or not readable.
       return {
         code: 404,
         headers: [Buffer.from("Content-Type: text/plain")],
@@ -111,15 +153,26 @@ async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
   }
 }
 
-async function writeHTTPResp(conn: TCPConn, res: HTTPRes): Promise<void> {
+async function writeHTTPResp(
+  conn: TCPConn,
+  res: HTTPRes,
+  isHead: boolean,
+): Promise<void> {
   // 1. Build the first line (e.g., "HTTP/1.1 200 OK").
-  // We only handle 200 and 404 for now.
-  const status = res.code === 200 ? "OK" : "Not Found";
+  const statusText: Record<number, string> = {
+    200: "OK",
+    206: "Partial Content",
+    404: "Not Found",
+    416: "Range Not Satisfiable",
+  };
+
+  const status = statusText[res.code] || "Unknown";
+
   let headerText = `HTTP/1.1 ${res.code} ${status}\r\n`;
 
   // If the length is -1, we do not know the size, so use chunked encoding.
   if (res.body.length < 0) {
-    headerText += `Transfer-Encoding : chunked\r\n`;
+    headerText += `Transfer-Encoding: chunked\r\n`;
   } else {
     //  Add Content-Length (from the BodyReader).
     headerText += `Content-Length: ${res.body.length}\r\n`;
@@ -135,6 +188,12 @@ async function writeHTTPResp(conn: TCPConn, res: HTTPRes): Promise<void> {
 
   //  Send the header bytes.
   await soWrite(conn, Buffer.from(headerText));
+
+  // if Head , skip the body entirely
+  if (isHead) {
+    await res.body.close?.(); // still close the file handle
+    return;
+  }
 
   //  Send the body bytes.and alsways close it when we're done.
   try {

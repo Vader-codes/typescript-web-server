@@ -35,35 +35,40 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.readerFromFile = readerFromFile;
 const fs = __importStar(require("fs/promises"));
-// Opens a file and returns a BodyReader that streams it.
-async function readerFromFile(path) {
-    // Open the file (throws if it doesn't exist or can't be read).
+async function readerFromFile(path, start = 0, end = -1) {
     const fp = await fs.open(path, "r");
-    // Get the file metadata.
     const stat = await fp.stat();
     if (!stat.isFile()) {
         await fp.close();
         throw new Error("not a regular file");
     }
     const size = stat.size;
-    let offset = 0;
+    // If end is -1, read to the end of the file.
+    if (end < 0) {
+        end = size;
+    }
+    // Clamp the end to the file size.
+    end = Math.min(end, size);
+    // Clamp the start.
+    start = Math.max(0, start);
+    // The total length of the slice.
+    const totalLength = end - start;
+    let offset = start;
     return {
-        length: size,
+        length: totalLength,
         read: async () => {
-            // If we've read the whole file, return EOF.
-            if (offset >= size) {
+            // If we've read the whole slice, return EOF.
+            if (offset >= end) {
                 return Buffer.from("");
             }
-            // Read a chunk from the file.
-            const chunkSize = Math.min(65536, size - offset); // 64KB chunks
+            // Read a chunk, but no more than what's left in the slice.
+            const chunkSize = Math.min(65536, end - offset);
             const buf = Buffer.alloc(chunkSize);
             const result = await fp.read(buf, 0, chunkSize, offset);
             offset += result.bytesRead;
-            // Return the actual bytes read.
             return buf.subarray(0, result.bytesRead);
         },
         close: async () => {
-            // Close the file handle when we're done.
             await fp.close();
         },
     };
