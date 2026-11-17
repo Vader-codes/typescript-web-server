@@ -90,6 +90,33 @@ async function handleReq(req, body) {
             // 1. Get the file size first (we need it for range calculations).
             const stat = await fs.stat(filePath);
             const size = stat.size;
+            // build cache headers.
+            const lastModified = stat.mtime.toUTCString();
+            const etag = `"${size}-${stat.mtime.getTime()}"`; // simple fingerprint
+            // 2. Check if the client already has a valid cache.
+            const ifModifiedSince = (0, http_io_1.fieldGet)(req.headers, "If-Modified-Since");
+            const ifNoneMatch = (0, http_io_1.fieldGet)(req.headers, "If-None-Match");
+            const cacheValid = (ifModifiedSince &&
+                ifModifiedSince.toString("latin1") === lastModified) ||
+                (ifNoneMatch && ifNoneMatch.toString("latin1") === etag);
+            // 3. If the cache is valid, return 304 Not Modified.
+            if (cacheValid) {
+                return {
+                    code: 304,
+                    headers: [
+                        Buffer.from(`Last-Modified: ${lastModified}`),
+                        Buffer.from(`ETag: ${etag}`),
+                    ],
+                    body: (0, http_io_1.readerFromMemory)(Buffer.from("")),
+                };
+            }
+            // 4. Add the validators to the response headers.
+            const headers = [
+                Buffer.from("Content-Type: application/octet-stream"),
+                Buffer.from("Accept-Ranges: bytes"),
+                Buffer.from(`Last-Modified: ${lastModified}`),
+                Buffer.from(`ETag: ${etag}`),
+            ];
             // 2. Check for the Range header.
             const rangeHeader = (0, http_io_1.fieldGet)(req.headers, "Range");
             let start = 0;
@@ -115,11 +142,6 @@ async function handleReq(req, body) {
             }
             // 3. Create the BodyReader for the slice.
             const body = await (0, static_file_1.readerFromFile)(filePath, start, end + 1);
-            // 4. Build the headers.
-            const headers = [
-                Buffer.from("Content-Type: application/octet-stream"),
-                Buffer.from("Accept-Ranges: bytes"),
-            ];
             if (isPartial) {
                 headers.push(Buffer.from(`Content-Range: bytes ${start}-${end}/${size}`));
                 return { code: 206, headers, body };
@@ -175,6 +197,7 @@ async function writeHTTPResp(conn, res, isHead) {
         206: "Partial Content",
         404: "Not Found",
         416: "Range Not Satisfiable",
+        304: "Not Modified",
     };
     const status = statusText[res.code] || "Unknown";
     let headerText = `HTTP/1.1 ${res.code} ${status}\r\n`;
