@@ -61,7 +61,7 @@ async function serveClient(socket) {
         // 2. We have a full header!
         // (These functions don't exist yet, we will build them next)
         const reqBody = (0, http_io_1.readerFromReq)(conn, buf, msg);
-        const res = await handleReq(msg, reqBody);
+        const res = (0, http_io_1.enableCompression)(msg, await handleReq(msg, reqBody));
         await writeHTTPResp(conn, res, msg.method === "HEAD");
         // Ensure the request body is completely read.
         // If the handler ignored it, we must drain it here.

@@ -5,6 +5,10 @@ import { HTTPError } from "./http_parser";
 
 import { BufferGenerator } from "./http_types";
 
+import * as stream from "stream";
+import * as zlib from "zlib";
+import { pipeline } from "stream/promises";
+
 // Find a header value by name (case-insensitive).
 export function fieldGet(headers: Buffer[], key: string): null | Buffer {
   // We convert the key to lowercase for comparison.
@@ -208,4 +212,88 @@ export async function* readChunks(conn: TCPConn, buf: DynBuf): BufferGenerator {
     }
     bufPop(buf, 2);
   }
+}
+
+// convert out custom bodyreader into a node.js Redable stream.
+export function body2stream(reader: BodyReader): stream.Readable {
+  return new stream.Readable({
+    // This callback is called when the consumer wants more data.
+    read: async function () {
+      try {
+        // Read a chunk from our custom reader.
+        const data = await reader.read();
+
+        // If empty, signal EOF by pushing null.
+        if (data.length === 0) {
+          this.push(null);
+        } else {
+          // Push the data to the stream.
+          this.push(data);
+        }
+      } catch (err) {
+        // If our reader throws, destroy the stream with the error.
+        this.destroy(err instanceof Error ? err : new Error("read error"));
+      }
+    },
+  });
+}
+
+// Wraps a BodyReader with gzip compression.
+export function gzipFilter(reader: BodyReader): BodyReader {
+  // 1. Create the gzip compressor (a Transform stream).
+  const gz = zlib.createGzip();
+
+  // 2. Convert our BodyReader into a Readable stream.
+  const input = body2stream(reader);
+
+  // 3. Pipe the input into the gzip compressor.
+  // We don't await this; it runs in the background.
+  pipeline(input, gz).catch((err) => {
+    gz.destroy(err);
+  });
+
+  // Get an async iterator for the gzip output.
+  const iter = gz.iterator();
+
+  // 4. Return a new BodyReader that reads from the gzip output.
+  return {
+    length: -1, // We don't know the compressed size, so use chunked.
+    read: async (): Promise<Buffer> => {
+      // Read compressed data from the gzip stream.
+      // read the next compressed chunk
+      const r = await iter.next();
+
+      // if stream is done return EOF.
+      if (r.done) {
+        return Buffer.from("");
+      }
+      // otherwise return the chunk
+      return r.value;
+    },
+    close: reader.close,
+  };
+}
+
+// Checks if the request accepts gzip and wraps the body.
+export function enableCompression(req: HTTPReq, res: HTTPRes): HTTPRes {
+  // 1. Check if the client supports gzip.
+  const acceptEncoding = fieldGet(req.headers, "Accept-Encoding");
+  if (!acceptEncoding || !acceptEncoding.toString("latin1").includes("gzip")) {
+    return res; // Client doesn't support gzip, return as-is.
+  }
+
+  // 2. Do not compress range requests (they need raw bytes).
+  if (fieldGet(req.headers, "Range")) {
+    return res; // Range requests, skip compression.
+  }
+
+  // 3. Wrap the body with gzip.
+  const compressed = gzipFilter(res.body);
+
+  // 4. Add the Content-Encoding header.
+  return {
+    code: res.code,
+    headers: [...res.headers, Buffer.from("Content-Encoding: gzip")],
+    body: compressed,
+  };
 }

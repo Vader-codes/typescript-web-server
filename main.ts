@@ -9,6 +9,7 @@ import {
   readerFromMemory,
   readerFromReq,
   fieldGet,
+  enableCompression,
 } from "./http_io";
 import { readerFromFile } from "./static_file";
 import { parseRangeHeader } from "./range";
@@ -37,7 +38,7 @@ async function serveClient(socket: net.Socket): Promise<void> {
     // 2. We have a full header!
     // (These functions don't exist yet, we will build them next)
     const reqBody: BodyReader = readerFromReq(conn, buf, msg);
-    const res: HTTPRes = await handleReq(msg, reqBody);
+    const res: HTTPRes = enableCompression(msg, await handleReq(msg, reqBody));
     await writeHTTPResp(conn, res, msg.method === "HEAD");
 
     // Ensure the request body is completely read.

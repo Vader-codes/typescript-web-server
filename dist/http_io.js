@@ -1,13 +1,52 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.fieldGet = fieldGet;
 exports.readerFromReq = readerFromReq;
 exports.readerFromMemory = readerFromMemory;
 exports.readerFromGenerator = readerFromGenerator;
 exports.readChunks = readChunks;
+exports.body2stream = body2stream;
+exports.gzipFilter = gzipFilter;
+exports.enableCompression = enableCompression;
 const net_io_1 = require("./net_io");
 const dynbuf_1 = require("./dynbuf");
 const http_parser_1 = require("./http_parser");
+const stream = __importStar(require("stream"));
+const zlib = __importStar(require("zlib"));
+const promises_1 = require("stream/promises");
 // Find a header value by name (case-insensitive).
 function fieldGet(headers, key) {
     // We convert the key to lowercase for comparison.
@@ -180,4 +219,78 @@ async function* readChunks(conn, buf) {
         }
         (0, dynbuf_1.bufPop)(buf, 2);
     }
+}
+// convert out custom bodyreader into a node.js Redable stream.
+function body2stream(reader) {
+    return new stream.Readable({
+        // This callback is called when the consumer wants more data.
+        read: async function () {
+            try {
+                // Read a chunk from our custom reader.
+                const data = await reader.read();
+                // If empty, signal EOF by pushing null.
+                if (data.length === 0) {
+                    this.push(null);
+                }
+                else {
+                    // Push the data to the stream.
+                    this.push(data);
+                }
+            }
+            catch (err) {
+                // If our reader throws, destroy the stream with the error.
+                this.destroy(err instanceof Error ? err : new Error("read error"));
+            }
+        },
+    });
+}
+// Wraps a BodyReader with gzip compression.
+function gzipFilter(reader) {
+    // 1. Create the gzip compressor (a Transform stream).
+    const gz = zlib.createGzip();
+    // 2. Convert our BodyReader into a Readable stream.
+    const input = body2stream(reader);
+    // 3. Pipe the input into the gzip compressor.
+    // We don't await this; it runs in the background.
+    (0, promises_1.pipeline)(input, gz).catch((err) => {
+        gz.destroy(err);
+    });
+    // Get an async iterator for the gzip output.
+    const iter = gz.iterator();
+    // 4. Return a new BodyReader that reads from the gzip output.
+    return {
+        length: -1, // We don't know the compressed size, so use chunked.
+        read: async () => {
+            // Read compressed data from the gzip stream.
+            // read the next compressed chunk
+            const r = await iter.next();
+            // if stream is done return EOF.
+            if (r.done) {
+                return Buffer.from("");
+            }
+            // otherwise return the chunk
+            return r.value;
+        },
+        close: reader.close,
+    };
+}
+// Checks if the request accepts gzip and wraps the body.
+function enableCompression(req, res) {
+    // 1. Check if the client supports gzip.
+    const acceptEncoding = fieldGet(req.headers, "Accept-Encoding");
+    if (!acceptEncoding || !acceptEncoding.toString("latin1").includes("gzip")) {
+        return res; // Client doesn't support gzip, return as-is.
+    }
+    // 2. Do not compress range requests (they need raw bytes).
+    if (fieldGet(req.headers, "Range")) {
+        return res; // Range requests, skip compression.
+    }
+    // 3. Wrap the body with gzip.
+    const compressed = gzipFilter(res.body);
+    // 4. Add the Content-Encoding header.
+    return {
+        code: res.code,
+        headers: [...res.headers, Buffer.from("Content-Encoding: gzip")],
+        body: compressed,
+    };
 }
